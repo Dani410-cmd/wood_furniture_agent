@@ -1,0 +1,7 @@
+aiogram==3.13.0
+langchain
+langchain-ollama
+langchain-community
+sqlalchemy
+aiosqlite
+python-dotenv
