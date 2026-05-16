@@ -1,0 +1,21 @@
+{
+  "name": "avito-parser",
+  "version": "1.0.0",
+  "description": "Парсер чатов Avito",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "login": "node src/login.js",
+    "dev": "node src/index.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "paddleocr": "^1.1.1",
+    "playwright": "^1.60.0",
+    "sharp": "^0.34.5",
+    "tesseract.js": "^7.0.0"
+  }
+}

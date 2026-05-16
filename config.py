@@ -6,5 +6,4 @@ load_dotenv()
 UMNICO_TOKEN = os.getenv("UMNICO_TOKEN")
 UMNICO_USER_ID = os.getenv("UMNICO_USER_ID")
 
-# Для будущей миграции на Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")

@@ -1,0 +1,30 @@
+[
+  {
+    "id": 1,
+    "title": "Для бизнеса",
+    "lastMessage": "Авито использует рекомендательные технологии.",
+    "time": "",
+    "unread": true
+  },
+  {
+    "id": 5,
+    "title": "Склад Спилов и Слэбов",
+    "lastMessage": "Вчера",
+    "time": "",
+    "unread": true
+  },
+  {
+    "id": 7,
+    "title": "Сообщения",
+    "lastMessage": "Вчера",
+    "time": "",
+    "unread": null
+  },
+  {
+    "id": 14,
+    "title": "Золотые спилы",
+    "lastMessage": "Вчера",
+    "time": "",
+    "unread": null
+  }
+]
