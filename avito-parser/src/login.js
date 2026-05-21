@@ -8,27 +8,19 @@ async function login() {
     try {
         await page.goto('https://www.avito.ru', {
             waitUntil: 'domcontentloaded',
-            timeout: 60000
+            timeout: 90000
         });
 
-        await page.waitForTimeout(3000);
+        await page.waitForTimeout(5000);
 
-        console.log('\n✅ Браузер открыт.');
-        console.log('👤 Залогинься в Avito вручную (если ещё не залогинен).');
-        console.log('После успешного входа вернись сюда и нажми **Enter**...\n');
+        console.log('\n👤 Залогинься вручную в открывшемся браузере.');
+        console.log('После успешного входа подожди 10 секунд и нажми Enter здесь...\n');
 
         process.stdin.once('data', async () => {
             console.log('\n💾 Сохраняю сессию...');
-
-            try {
-                await saveStorageState(context);
-                console.log('🎉 Сессия успешно сохранена!');
-            } catch (e) {
-                console.error('❌ Ошибка сохранения сессии:', e.message);
-            }
-
+            await saveStorageState(context);
+            console.log('🎉 Сессия успешно сохранена!');
             await browser.close();
-            console.log('🔒 Браузер закрыт.');
             process.exit(0);
         });
 

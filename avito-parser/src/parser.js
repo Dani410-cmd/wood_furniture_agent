@@ -1,6 +1,7 @@
 import sharp from 'sharp';
 import { createWorker } from 'tesseract.js';
 import fs from 'fs';
+import { db } from './db.js';
 
 let worker = null;
 
@@ -15,7 +16,7 @@ async function initOCR() {
     return worker;
 }
 
-export async function scanChats(page) {
+export async function scanAndProcessChats(page) {
     console.log('\n🌐 Переходим в сообщения...');
     await page.goto('https://www.avito.ru/profile/messenger', {
         waitUntil: 'domcontentloaded',
@@ -60,7 +61,7 @@ export async function scanChats(page) {
         .sharpen()
         .toFile('chats_only.png');
 
-    console.log(`✅ Обрезана зона (top = ${top})`);
+    console.log(`✅ Обрезана зона списка чатов (top = ${top})`);
 
     const worker = await initOCR();
     const { data: { text } } = await worker.recognize('chats_only.png');
@@ -70,49 +71,95 @@ export async function scanChats(page) {
     const chats = [];
     for (let i = 0; i < lines.length - 2; i += 3) {
         let title = lines[i].trim();
+        if (title.toLowerCase().includes('поддержка') || title.toLowerCase().includes('будем рады') || title.length < 5) continue;
 
-        const titleLower = title.toLowerCase();
-        if (titleLower.includes('поддержка') || titleLower.includes('будем рады') || title.length < 5) {
-            continue;
-        }
-
-        // === УЛУЧШЕННАЯ ОЧИСТКА НАЗВАНИЙ ===
         title = title
             .replace(/е$/, '')
             .replace(/о$/, '')
             .replace(/^[^\wА-Яа-я\s-]+/, '')
-            .replace(/ДвижоОКК?/i, 'ДвижОК')     // исправляем ДвижОКК и ДвижоОК
-            .replace(/\s+[A-Z]$/, '')            // убираем одиночные буквы E, I и т.д.
+            .replace(/\s+[A-Z]$/, '')
             .trim();
 
-        let announcement = lines[i + 1] || '';
-        let lastMessage = lines[i + 2] || '';
-
-        announcement = announcement
-            .replace(/[\s·•-]+\s*(\d[\d\s.,]*)\s*[РP2]/i, ' - $1 Р')
-            .replace(/,\s*(\d)/g, ' - $1')
-            .replace(/^Ф/, '')
-            .replace(/-+/g, '-')
-            .trim();
-
-        if (lastMessage.includes('Чат создан') || lastMessage.includes('Задайте вопрос')) {
-            lastMessage = 'Новый чат';
-        }
-
-        chats.push({
-            title: title,
-            announcement: announcement,
-            lastMessage: lastMessage
-        });
+        chats.push({ title });
     }
 
-    console.log(`\n🎯 Найдено чатов: ${chats.length}\n`);
-    chats.forEach((chat, i) => {
-        console.log(`#${i + 1} ${chat.title}`);
-        console.log(`   Объявление: ${chat.announcement}`);
-        console.log(`   Сообщение: ${chat.lastMessage}`);
-        console.log('─'.repeat(80));
-    });
+    console.log(`\n🎯 Найдено чатов: ${chats.length}`);
 
-    return chats;
+    if (chats.length === 0) return;
+
+    console.log(`\n🔍 Открываем чат: ${chats[0].title}`);
+    const clickY = top + 45;
+    await page.mouse.click(left + 120, clickY);
+    await page.waitForTimeout(7000);
+
+    // ====================== ОБЛАСТЬ СООБЩЕНИЙ ======================
+    console.log('📸 Делаем скриншот открытого чата...');
+    const fullScreenshot = await page.screenshot({ fullPage: true });
+
+    const metadata = await sharp(fullScreenshot).metadata();
+    console.log(`📐 Размер скриншота: ${metadata.width}×${metadata.height}`);
+
+    let messagesArea = {
+        left: 400,
+        top: 215,
+        width: 620,
+        height: 500
+    };
+
+    if (messagesArea.left + messagesArea.width > metadata.width) {
+        messagesArea.width = metadata.width - messagesArea.left - 30;
+    }
+    if (messagesArea.top + messagesArea.height > metadata.height) {
+        messagesArea.height = metadata.height - messagesArea.top - 30;
+    }
+
+    // Специальные параметры для чата (без сильного greyscale)
+    await sharp(fullScreenshot)
+        .extract(messagesArea)
+        .resize(1600)                    // чуть больше
+        .modulate({ brightness: 1.15, contrast: 1.1 })  // лёгкое улучшение
+        .sharpen(0.8)                    // слабое sharpening
+        .toFile('chat_messages.png');
+
+    console.log(`✅ Область сообщений сохранена в chat_messages.png (специальные параметры)`);
+
+    // OCR
+    const { data: { text: messagesText } } = await worker.recognize('chat_messages.png');
+
+    console.log('\n📝 Распознанный текст:');
+    console.log(messagesText);
+
+    // === СТРУКТУРИЗАЦИЯ ===
+    const msgLines = messagesText.split('\n').map(l => l.trim()).filter(l => l.length > 3);
+
+    console.log('\n📋 Структурированные сообщения:');
+    let currentDate = '';
+
+    for (let line of msgLines) {
+        if (line.includes('Прочитано') || line.includes('печатает') || line.length < 4) continue;
+
+        if (/^(Понедельник|Вторник|Среда|Четверг|Пятница|Суббота|Воскресенье|Сегодня|Вчера)/.test(line)) {
+            currentDate = line;
+            console.log(`\n📅 ${currentDate}`);
+            continue;
+        }
+
+        let cleanLine = line.replace(/[✓✔️]{1,4}/g, '').trim();
+
+        const timeLeft = cleanLine.match(/^(\d{1,2}:\d{2})\s+(.+)$/);
+        const timeRight = cleanLine.match(/^(.+?)\s+(\d{1,2}:\d{2})$/);
+
+        if (timeLeft) {
+            console.log(`Менеджер ${timeLeft[1]}: ${timeLeft[2]}`);
+        } else if (timeRight) {
+            console.log(`Клиент ${timeRight[2]}: ${timeRight[1]}`);
+        } else if (cleanLine.length > 5) {
+            console.log(`? ${cleanLine}`);
+        }
+    }
+
+    const chatId = chats[0].title;
+    db.prepare('INSERT OR IGNORE INTO chats (chat_id, title) VALUES (?, ?)').run(chatId, chats[0].title);
+
+    console.log('\n💾 Данные сохранены в БД');
 }

@@ -1,5 +1,5 @@
 import { createBrowserContext } from './browser.js';
-import { scanChats } from './parser.js';   // ← важно: scanChats
+import { scanAndProcessChats } from './parser.js';   // ← правильный импорт
 
 async function main() {
     console.log('🚀 Avito Chat Parser запущен\n');
@@ -7,11 +7,12 @@ async function main() {
     const { browser, page } = await createBrowserContext();
 
     try {
-        await scanChats(page);
+        await scanAndProcessChats(page);
+        console.log('\n🎉 Парсинг завершён.');
     } catch (error) {
         console.error('❌ Ошибка:', error.message);
     } finally {
-        // await browser.close(); // оставляем закомментированным
+        // await browser.close(); // оставляем открытым
     }
 }
 
