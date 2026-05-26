@@ -22,13 +22,27 @@ function isDateLine(line) {
     return /^(Понедельник|Вторник|Среда|Четверг|Пятница|Суббота|Воскресенье|Сегодня|Вчера)/i.test(line);
 }
 
+function isServiceMessageLine(line) {
+    return /непрочитанные сообщения/i.test(line) ||
+        /^прочитано$/i.test(line) ||
+        /^доставлено$/i.test(line) ||
+        /^печатает/i.test(line) ||
+        /^\.{2,}$/i.test(line) ||
+        /^…+$/i.test(line);
+}
+
 function cleanOcrText(text) {
-    return text
+    return String(text || '')
         .replace(/[✓✔️√]+/g, '')
         .replace(/Прочитано/gi, '')
+        .replace(/Доставлено/gi, '')
         .replace(/печатает/gi, '')
-        .replace(/\bCM\b/g, 'см')
-        .replace(/\bcm\b/g, 'см')
+        .replace(/Непрочитанные сообщения/gi, '')
+        .replace(/\.\.\./g, '')
+        .replace(/…/g, '')
+        .replace(/(\d)\s*CM\b/gi, '$1 см')
+        .replace(/\bCM\b/gi, 'см')
+        .replace(/\bcm\b/gi, 'см')
         .replace(/\s+/g, ' ')
         .trim();
 }
@@ -56,7 +70,7 @@ function extractTimeAndText(rawText) {
         };
     }
 
-    const timeRegex = /\b\d{1,2}:\d{2}\b/g;
+    const timeRegex = /\b\d{1,2}[:.]\d{2}\b/g;
     const times = text.match(timeRegex);
 
     if (!times || times.length === 0) {
@@ -66,10 +80,10 @@ function extractTimeAndText(rawText) {
         };
     }
 
-    const time = times[times.length - 1];
+    const time = times[times.length - 1].replace('.', ':');
 
     text = text
-        .replace(time, '')
+        .replace(times[times.length - 1], '')
         .replace(/\s+/g, ' ')
         .trim();
 
@@ -237,9 +251,18 @@ async function recognizeMessageBlocks(imagePath) {
             .toFile(cropPath);
 
         const { data: { text } } = await ocrWorker.recognize(cropPath);
+
+        const rawCleaned = String(text || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        if (isServiceMessageLine(rawCleaned)) {
+            continue;
+        }
+
         const cleaned = cleanOcrText(text);
 
-        if (!cleaned || cleaned.length < 2) {
+        if (!cleaned || cleaned.length < 2 || isServiceMessageLine(cleaned)) {
             continue;
         }
 
@@ -250,7 +273,7 @@ async function recognizeMessageBlocks(imagePath) {
 
         const { time, text: messageText } = extractTimeAndText(cleaned);
 
-        if (!messageText || messageText.length < 2) {
+        if (!messageText || messageText.length < 2 || isServiceMessageLine(messageText)) {
             continue;
         }
 
@@ -268,7 +291,82 @@ async function recognizeMessageBlocks(imagePath) {
         });
     }
 
-    return messages;
+    return mergeCloseMessageLines(messages);
+}
+
+function mergeCloseMessageLines(messages) {
+    const merged = [];
+
+    for (const message of messages) {
+        const last = merged[merged.length - 1];
+
+        if (!last) {
+            merged.push(message);
+            continue;
+        }
+
+        const lastBlock = last.block;
+        const currentBlock = message.block;
+
+        if (!lastBlock || !currentBlock) {
+            merged.push(message);
+            continue;
+        }
+
+        const verticalGap = currentBlock.top - (lastBlock.top + lastBlock.height);
+        const closeVertically = verticalGap >= 0 && verticalGap <= 22;
+        const sameDate = (last.date || '') === (message.date || '');
+
+        const currentLooksLikeContinuation = isContinuationText(message.text);
+
+        /*
+          Частый случай:
+          OCR разрезал правое сообщение менеджера на две строки.
+          Вторая короткая строка может определиться как client,
+          потому что находится левее центра.
+        */
+        const shouldMerge =
+            closeVertically &&
+            sameDate &&
+            currentLooksLikeContinuation;
+
+        if (shouldMerge) {
+            last.text = `${last.text} ${message.text}`.replace(/\s+/g, ' ').trim();
+
+            if (!last.time && message.time) {
+                last.time = message.time;
+            }
+
+            last.block = {
+                left: Math.min(lastBlock.left, currentBlock.left),
+                top: Math.min(lastBlock.top, currentBlock.top),
+                width: Math.max(
+                    lastBlock.left + lastBlock.width,
+                    currentBlock.left + currentBlock.width
+                ) - Math.min(lastBlock.left, currentBlock.left),
+                height: Math.max(
+                    lastBlock.top + lastBlock.height,
+                    currentBlock.top + currentBlock.height
+                ) - Math.min(lastBlock.top, currentBlock.top),
+            };
+
+            continue;
+        }
+
+        merged.push(message);
+    }
+
+    return merged;
+}
+
+function isContinuationText(text) {
+    const value = String(text || '').trim();
+
+    if (!value) return false;
+    if (isServiceMessageLine(value)) return false;
+
+    return /^[а-яё]/.test(value) ||
+        value.length <= 25;
 }
 
 function printStructuredMessages(messages) {
@@ -289,75 +387,148 @@ function printStructuredMessages(messages) {
     }
 }
 
-async function recognizeChatsList(imagePath) {
+async function recognizeChatsList(imagePath, listTop) {
     const ocrWorker = await initOCR();
-    const { data: { text } } = await ocrWorker.recognize(imagePath);
 
-    const lines = text
-        .split('\n')
-        .map(l => l.trim())
-        .filter(l => l.length > 3);
+    const metadata = await sharp(imagePath).metadata();
+    const imageWidth = metadata.width;
+    const imageHeight = metadata.height;
 
     const chats = [];
 
-    for (let i = 0; i < lines.length - 2; i += 3) {
-        let title = lines[i].trim();
+    const visibleChatsCount = 8;
+    const rowHeight = Math.floor(imageHeight / visibleChatsCount);
+    const originalListHeight = 740;
+    const scaleBackToScreen = originalListHeight / imageHeight;
 
-        if (
-            title.toLowerCase().includes('поддержка') ||
-            title.toLowerCase().includes('будем рады') ||
-            title.toLowerCase().includes('рады помочь') ||
-            title.length < 5
-        ) {
-            continue;
-        }
+    for (let i = 0; i < visibleChatsCount; i++) {
+        const rowTop = i * rowHeight;
+        const cropHeight = i === visibleChatsCount - 1
+            ? imageHeight - rowTop
+            : rowHeight;
 
-        title = title
-            .replace(/^[^\wА-Яа-я\s-]+/, '')
-            .replace(/\s+[A-Z]$/, '')
-            .trim();
+        if (cropHeight < 60) continue;
 
-        if (!title) continue;
+        const rowPath = `chat_row_${String(i + 1).padStart(2, '0')}.png`;
 
-        chats.push({ title });
+        await sharp(imagePath)
+            .extract({
+                left: 0,
+                top: rowTop,
+                width: imageWidth,
+                height: cropHeight,
+            })
+            .greyscale()
+            .normalize()
+            .sharpen()
+            .toFile(rowPath);
+
+        const { data: { text } } = await ocrWorker.recognize(rowPath);
+
+        const lines = text
+            .split('\n')
+            .map(line => cleanChatListLine(line))
+            .filter(line => line.length > 1)
+            .filter(line => !isBadChatListLine(line));
+
+        if (lines.length === 0) continue;
+
+        const parsed = parseChatRowLines(lines, i + 1);
+
+        const clickY = Math.round(
+            listTop + (rowTop + cropHeight / 2) * scaleBackToScreen
+        );
+
+        chats.push({
+            ...parsed,
+            clickY,
+            rowIndex: i + 1,
+            rawText: lines.join(' | '),
+        });
     }
 
     return chats;
 }
 
-function ensureDbSchema() {
-    db.prepare(`
-        CREATE TABLE IF NOT EXISTS chats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id TEXT UNIQUE NOT NULL,
-            title TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    `).run();
+function cleanChatListLine(line) {
+    return String(line || '')
+        .replace(/[✓✔️√]+/g, '')
+        .replace(/^[ЪЬ%#@*.,:;!?\\/\\s]+/i, '')
+        .replace(/\s+/g, ' ')
+        .replace(/(\d+)\s*[РP]\b/g, '$1₽')
+        .replace(/\b[РP]\b/g, '₽')
+        .replace(/^[^\wА-Яа-яЁё\s().,'"№:!?₽-]+/, '')
+        .trim();
+}
 
-    db.prepare(`
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            sender TEXT,
-            text TEXT,
-            time TEXT,
-            date TEXT,
-            message_hash TEXT UNIQUE NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(chat_id) REFERENCES chats(id)
-        )
-    `).run();
+function isBadChatListLine(line) {
+    if (!line) return true;
 
-    db.prepare(`
-        CREATE INDEX IF NOT EXISTS idx_messages_chat_id 
-        ON messages(chat_id)
-    `).run();
+    const badPatterns = [
+        /поддержка/i,
+        /будем рады/i,
+        /рады помочь/i,
+        /^сегодня$/i,
+        /^вчера$/i,
+        /^\d{1,2}:\d{2}$/,
+        /^онлайн$/i,
+        /^прочитано$/i,
+        /^печатает/i,
+    ];
 
-    db.prepare(`
-        CREATE INDEX IF NOT EXISTS idx_messages_hash 
-        ON messages(message_hash)
-    `).run();
+    return badPatterns.some(pattern => pattern.test(line));
+}
+
+function isEmptyLeadPreview(text) {
+    return /пользователь создал чат/i.test(String(text || ''));
+}
+
+function parseChatRowLines(lines, rowIndex) {
+    let username = lines[0] || `Чат ${rowIndex}`;
+    let listing = lines[1] || '';
+    let preview = lines.slice(2).join(' ');
+
+    username = cleanUsername(username);
+    listing = cleanChatListLine(listing);
+    preview = cleanChatListLine(preview);
+
+    const isEmptyLead = isEmptyLeadPreview(preview);
+
+    if (isEmptyLead) {
+        preview = 'Пользователь создал чат';
+    }
+
+    const suspiciousUsername =
+        !username ||
+        username.length < 2 ||
+        username.length > 40 ||
+        /жд[её]т ответа/i.test(username) ||
+        /устраивает цена/i.test(username) ||
+        /вам нужна/i.test(username) ||
+        /понятно/i.test(username) ||
+        /спасибо/i.test(username);
+
+    if (suspiciousUsername) {
+        username = `Чат ${rowIndex}`;
+    }
+
+    return {
+        title: username,
+        username,
+        listing,
+        preview,
+        is_empty_lead: isEmptyLead,
+        suspiciousUsername,
+    };
+}
+
+function cleanUsername(username) {
+    return String(username || '')
+        .replace(/\s+/g, ' ')
+        .replace(/[|]+/g, '')
+        .replace(/^[^А-Яа-яA-Za-z0-9Ёё]+/, '')
+        .replace(/\s+[еоo0•●]$/i, '')
+        .trim();
 }
 
 function saveChatAndMessages(chat, messages) {
@@ -398,6 +569,9 @@ function saveChatAndMessages(chat, messages) {
             UPDATE chats
             SET 
                 title = ?,
+                listing = ?,
+                preview = ?,
+                is_empty_lead = ?,
                 last_updated = CURRENT_TIMESTAMP,
                 last_message_hash = ?,
                 last_message_text = ?,
@@ -407,6 +581,9 @@ function saveChatAndMessages(chat, messages) {
             WHERE chat_id = ?
         `).run(
             chat.title,
+            chat.listing || null,
+            chat.preview || null,
+            chat.is_empty_lead ? 1 : 0,
             lastMessage.message_hash,
             lastMessage.text,
             lastMessage.time,
@@ -419,9 +596,18 @@ function saveChatAndMessages(chat, messages) {
             UPDATE chats
             SET 
                 title = ?,
+                listing = ?,
+                preview = ?,
+                is_empty_lead = ?,
                 last_updated = CURRENT_TIMESTAMP
             WHERE chat_id = ?
-        `).run(chat.title, chat.chat_id);
+        `).run(
+            chat.title,
+            chat.listing || null,
+            chat.preview || null,
+            chat.is_empty_lead ? 1 : 0,
+            chat.chat_id
+        );
     }
 
     return {
@@ -429,6 +615,7 @@ function saveChatAndMessages(chat, messages) {
         messages_seen: messages.length,
         messages_created: createdMessages,
         last_message: lastMessage,
+        is_empty_lead: chat.is_empty_lead,
     };
 }
 
@@ -466,12 +653,12 @@ export async function scanAndProcessChats(page) {
 
     if (hasSupport) {
         console.log('🔄 Поддержка сверху — сдвигаем');
-        top = 420;
+        top = 450;
     }
 
     const left = 460;
-    const width = 535;
-    const height = 810;
+    const width = 520;
+    const height = 740;
 
     await sharp(screenshot)
         .extract({ left, top, width, height })
@@ -481,9 +668,9 @@ export async function scanAndProcessChats(page) {
         .sharpen()
         .toFile('chats_only.png');
 
-    console.log(`✅ Обрезана зона списка чатов (top = ${top})`);
+    console.log(`✅ Обрезана зона списка чатов (top = ${top}, left = ${left}, width = ${width}, height = ${height})`);
 
-    const chats = await recognizeChatsList('chats_only.png');
+    const chats = await recognizeChatsList('chats_only.png', top);
 
     console.log(`\n🎯 Найдено чатов: ${chats.length}`);
 
@@ -492,14 +679,55 @@ export async function scanAndProcessChats(page) {
         return;
     }
 
-    console.log(`\n🔍 Открываем чат: ${chats[0].title}`);
+    console.log('\n📋 Найденные чаты:');
 
-    const clickY = top + 45;
+    chats.forEach((chat, index) => {
+        console.log(`${index + 1}. ${chat.title} | y=${chat.clickY}`);
+        console.log(`   👤 Имя: ${chat.username}`);
+        console.log(`   📌 Объявление: ${chat.listing || '-'}`);
+        console.log(`   💬 Последнее: ${chat.preview || '-'}`);
+
+        if (chat.is_empty_lead) {
+            console.log('   🟡 Пустой лид: пользователь создал чат');
+        }
+
+        console.log(`   OCR: ${chat.rawText}`);
+
+        if (chat.suspiciousUsername) {
+            console.log('   ⚠️ Имя подозрительное, используется запасное название');
+        }
+    });
+
+    console.log('\n👉 Введи номер чата для теста и нажми Enter:');
+
+    const selectedChatNumber = await new Promise(resolve => {
+        process.stdin.once('data', data => {
+            resolve(Number(data.toString().trim()));
+        });
+    });
+
+    const selectedIndex = Number.isInteger(selectedChatNumber) && selectedChatNumber > 0
+        ? selectedChatNumber - 1
+        : 0;
+
+    const selectedChat = chats[selectedIndex] || chats[0];
+
+    console.log(`\n🔍 Открываем чат: ${selectedChat.title}`);
+
+    const clickY = selectedChat.clickY;
+
+    console.log(`🖱️ Кликаем по Y=${clickY}`);
+
     await page.mouse.click(left + 120, clickY);
     await page.waitForTimeout(7000);
 
     const chatUrl = page.url();
     console.log('🔗 URL открытого чата:', chatUrl);
+
+    // Уводим мышку вправо от области сообщений,
+    // чтобы исчезли hover-элементы Авито: "...", кнопки действий и т.д.
+    await page.mouse.move(1250, 500);
+    await page.waitForTimeout(500);
 
     console.log('📸 Делаем скриншот открытого чата...');
 
@@ -542,8 +770,11 @@ export async function scanAndProcessChats(page) {
 
     const chat = {
         chat_id: chatUrl,
-        title: chats[0].title,
+        title: selectedChat.title,
         url: chatUrl,
+        listing: selectedChat.listing,
+        preview: selectedChat.preview,
+        is_empty_lead: selectedChat.is_empty_lead,
     };
 
     const messagesWithHash = structuredMessages.map(message => ({
@@ -558,6 +789,10 @@ export async function scanAndProcessChats(page) {
     console.log('\n💾 Чат и сообщения сохранены в БД');
     console.log(`🧾 Сообщений распознано: ${saveStats.messages_seen}`);
     console.log(`🆕 Новых сообщений сохранено: ${saveStats.messages_created}`);
+
+    if (saveStats.is_empty_lead) {
+        console.log('🟡 Этот чат сохранён как пустой лид');
+    }
 
     if (saveStats.messages_created > 0) {
         console.log(`🔥 Есть новые сообщения: ${saveStats.messages_created}`);
